@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import { WebsimSocket, useQuery } from '@websim/use-query';
 
@@ -17,53 +17,109 @@ const room = new WebsimSocket({
   },
 });
 
-// Helper to get a simple text representation from DocumentNode
-// This is a basic implementation. A more robust one would traverse the node tree.
-function getTextFromDocumentNode(node) {
-  if (!node || !node.children || !Array.isArray(node.children)) {
-    return "";
+// Helper function to recursively extract text from a DocumentNode structure
+function extractTextFromNode(node) {
+  if (!node) return "";
+  let result = "";
+
+  if (node.type === "text" && typeof node.text === "string") {
+    result += node.text;
   }
-  let text = "";
-  try {
-    for (const child of node.children) {
-      if (child.type === "paragraph" && child.children) {
-        for (const pChild of child.children) {
-          if (pChild.type === "text" && pChild.text) {
-            text += pChild.text + "\n";
-          }
+
+  // Recursively process children if they exist
+  if (node.children && Array.isArray(node.children)) {
+    node.children.forEach(child => {
+      result += extractTextFromNode(child);
+      // Add paragraph breaks for block elements
+      if (child.type === "paragraph" || child.type === "list_item" || child.type === "break") {
+        result += "\n";
+      } else if (child.type !== "text" && child.type !== "document") { 
+        // Add space for other non-text inline elements to avoid words sticking together,
+        // but not after the entire document or a text node itself.
+        const nextCharIsSpaceOrNewline = result.match(/[\s\n]$/);
+        if(!nextCharIsSpaceOrNewline) {
+            result += " ";
         }
       }
-    }
-  } catch (e) {
-    console.warn("Error parsing DocumentNode content:", e);
-    return JSON.stringify(node); // Fallback to stringified JSON
+    });
   }
-  return text.trim();
+  
+  // Example: Handle link nodes if they don't have children or you want to add the URL
+  // if (node.type === "link" && (!node.children || node.children.length === 0) && node.url) {
+  //   result += ` ${node.url} `;
+  // }
+
+  return result;
+}
+
+// Wrapper function to parse DocumentNode and clean up the extracted text
+function getTextFromDocumentNodeImproved(docNode) {
+  if (!docNode || docNode.type !== "document" || !docNode.children) {
+    // Try to handle if it's not a full document node but just a part
+    if (docNode && docNode.children && Array.isArray(docNode.children)) {
+      // Fallback for partial structures if needed, or just return ""
+    } else if (docNode && docNode.type === 'paragraph') {
+       // If it's just a paragraph node, process it
+    } else {
+      return "";
+    }
+  }
+  
+  let rawText = extractTextFromNode(docNode);
+  // Clean up: replace multiple newlines with a single one, and trim spaces around newlines.
+  rawText = rawText.replace(/\s*\n\s*/g, "\n").trim();
+  // Replace multiple spaces with a single space
+  rawText = rawText.replace(/ +/g, " ");
+  return rawText;
 }
 
 function App() {
-  const [isSyncing, setIsSyncing] = useState(true); // Initialize to true for the first sync
+  const [isSyncing, setIsSyncing] = useState(true); // For UI feedback
   const [syncError, setSyncError] = useState(null);
+  const syncInProgressRef = useRef(false); // Functional lock for sync operation
 
-  // syncMetadataComments is defined here, outside useEffect, so it's stable.
-  // It already handles setting setIsSyncing(false) in its finally block and setSyncError on error.
-  const syncMetadataComments = async () => {
+  const syncMetadataComments = useCallback(async () => {
+    if (syncInProgressRef.current) {
+      console.log("Sync operation already in progress. Skipping this interval call.");
+      return;
+    }
+    syncInProgressRef.current = true;
+    setIsSyncing(true); 
+    setSyncError(null); // Clear previous sync error before a new attempt
+
     try {
       console.log("Attempting to sync metadata comments...");
+      if (window.websim && window.websim.metadata) {
+        // Log a stringified version for easier inspection of the structure
+        try {
+            console.log("Current window.websim.metadata structure:", JSON.stringify(window.websim.metadata, null, 2));
+        } catch (e) {
+            console.warn("Could not stringify window.websim.metadata (circular refs?):", window.websim.metadata);
+        }
+      } else {
+        console.log("window.websim or window.websim.metadata is not available at this time.");
+      }
+
       const metadataComments = window.websim?.metadata?.comments;
 
       if (!metadataComments) {
           console.warn("window.websim.metadata.comments is not found. No comments to sync.");
-          // Don't set isSyncing here, let the caller's finally block do it.
+          // setIsSyncing(false) will be handled in finally
+          syncInProgressRef.current = false; // Release lock early if no comments object
+          setIsSyncing(false); // Update UI
           return;
       }
       if (!Array.isArray(metadataComments)) {
           console.warn("window.websim.metadata.comments is not an array. Structure:", metadataComments);
           setSyncError("Metadata comments are not in the expected array format.");
+          syncInProgressRef.current = false; // Release lock
+          setIsSyncing(false); // Update UI
           return;
       }
       if (metadataComments.length === 0) {
           console.log("No metadata comments found to sync.");
+          syncInProgressRef.current = false; // Release lock
+          setIsSyncing(false); // Update UI
           return;
       }
 
@@ -75,16 +131,21 @@ function App() {
           continue;
         }
         if (!mc.id || !mc.author || !mc.author.id || !mc.author.username || !mc.created_at) {
-          console.warn("Skipping malformed metadata comment (missing essential fields):", mc);
+          console.warn("Skipping malformed metadata comment (missing essential fields): id, author.id, author.username, created_at. Comment data:", mc);
           continue;
         }
         
         let contentToStore = mc.raw_content;
         if (contentToStore == null) { // Checks for null or undefined
           if (mc.content) {
-            contentToStore = getTextFromDocumentNode(mc.content) || "[Content not parsable]";
+            contentToStore = getTextFromDocumentNodeImproved(mc.content);
+            if (!contentToStore && mc.content.children && mc.content.children.length > 0) {
+              contentToStore = "[Content structure present, but no text extracted or content is empty]";
+            } else if (!contentToStore) {
+              contentToStore = "[No textual content found in content object]";
+            }
           } else {
-            contentToStore = "[No content]";
+            contentToStore = "[No raw_content or content field provided]";
           }
         }
 
@@ -103,24 +164,23 @@ function App() {
       setSyncError(`Failed to sync comments: ${error.message}`);
     } finally {
       setIsSyncing(false);
+      syncInProgressRef.current = false;
     }
-  };
+  }, []); // Dependencies: setIsSyncing, setSyncError are stable. syncInProgressRef is stable. COLLECTION_NAME is const.
 
   useEffect(() => {
-    const performSyncOperation = async () => {
-      setSyncError(null); // Clear previous sync error
-      setIsSyncing(true); // Indicate that a sync operation is starting
-      await syncMetadataComments(); 
+    const performInitialAndIntervalSync = () => {
+      syncMetadataComments();
     };
 
-    performSyncOperation(); // Perform initial sync
+    performInitialAndIntervalSync(); // Perform initial sync
 
-    const intervalId = setInterval(performSyncOperation, 7000); // Sync every 7 seconds
+    const intervalId = setInterval(performInitialAndIntervalSync, 7000); // Sync every 7 seconds
     
     return () => {
       clearInterval(intervalId); // Cleanup interval on component unmount
     };
-  }, []); // Empty dependency array: runs once on mount, cleans up on unmount.
+  }, [syncMetadataComments]); // Add syncMetadataComments as a dependency.
 
   const { data: syncedComments, loading: loadingDbComments, error: queryError } = useQuery(
     room.query(
@@ -193,7 +253,6 @@ function CommentItem({ comment }) {
   } catch (e) {
     console.warn("Failed to parse date:", comment.metadata_created_at, e);
   }
-
 
   return (
     <article className="bg-white shadow-lg rounded-xl p-4 sm:p-5 border border-gray-200 hover:shadow-xl transition-shadow duration-200">
