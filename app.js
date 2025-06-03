@@ -41,81 +41,86 @@ function getTextFromDocumentNode(node) {
   return text.trim();
 }
 
-
 function App() {
-  const [isSyncing, setIsSyncing] = useState(true);
+  const [isSyncing, setIsSyncing] = useState(true); // Initialize to true for the first sync
   const [syncError, setSyncError] = useState(null);
 
-  useEffect(() => {
-    const syncMetadataComments = async () => {
-      try {
-        console.log("Attempting to sync metadata comments...");
-        const metadataComments = window.websim?.metadata?.comments;
+  // syncMetadataComments is defined here, outside useEffect, so it's stable.
+  // It already handles setting setIsSyncing(false) in its finally block and setSyncError on error.
+  const syncMetadataComments = async () => {
+    try {
+      console.log("Attempting to sync metadata comments...");
+      const metadataComments = window.websim?.metadata?.comments;
 
-        if (!metadataComments) {
-            console.warn("window.websim.metadata.comments is not found. No comments to sync.");
-            setIsSyncing(false);
-            return;
-        }
-        if (!Array.isArray(metadataComments)) {
-            console.warn("window.websim.metadata.comments is not an array. Structure:", metadataComments);
-            setSyncError("Metadata comments are not in the expected array format.");
-            setIsSyncing(false);
-            return;
-        }
-        if (metadataComments.length === 0) {
-            console.log("No metadata comments found to sync.");
-            setIsSyncing(false);
-            return;
-        }
-
-        console.log(`Found ${metadataComments.length} metadata comments to process.`);
-
-        for (const mc of metadataComments) {
-          if (!mc || typeof mc !== 'object') {
-            console.warn("Skipping invalid metadata comment (not an object):", mc);
-            continue;
-          }
-          if (!mc.id || !mc.author || !mc.author.id || !mc.author.username || !mc.created_at) {
-            console.warn("Skipping malformed metadata comment (missing essential fields):", mc);
-            continue;
-          }
-          
-          let contentToStore = mc.raw_content;
-          if (contentToStore == null) { // Checks for null or undefined
-            if (mc.content) {
-              contentToStore = getTextFromDocumentNode(mc.content) || "[Content not parsable]";
-            } else {
-              contentToStore = "[No content]";
-            }
-          }
-
-          const commentData = {
-            id: mc.id.toString(), // Ensure ID is a string
-            raw_content: contentToStore,
-            author_id: mc.author.id.toString(),
-            author_username: mc.author.username.toString(),
-            metadata_created_at: mc.created_at, // Assuming this is ISO string
-          };
-          // console.log("Upserting comment:", commentData);
-          await room.collection(COLLECTION_NAME).upsert(commentData);
-        }
-        console.log("Finished syncing metadata comments.");
-      } catch (error) {
-        console.error("Error syncing metadata comments:", error);
-        setSyncError(`Failed to sync comments: ${error.message}`);
-      } finally {
-        setIsSyncing(false);
+      if (!metadataComments) {
+          console.warn("window.websim.metadata.comments is not found. No comments to sync.");
+          // Don't set isSyncing here, let the caller's finally block do it.
+          return;
       }
+      if (!Array.isArray(metadataComments)) {
+          console.warn("window.websim.metadata.comments is not an array. Structure:", metadataComments);
+          setSyncError("Metadata comments are not in the expected array format.");
+          return;
+      }
+      if (metadataComments.length === 0) {
+          console.log("No metadata comments found to sync.");
+          return;
+      }
+
+      console.log(`Found ${metadataComments.length} metadata comments to process.`);
+
+      for (const mc of metadataComments) {
+        if (!mc || typeof mc !== 'object') {
+          console.warn("Skipping invalid metadata comment (not an object):", mc);
+          continue;
+        }
+        if (!mc.id || !mc.author || !mc.author.id || !mc.author.username || !mc.created_at) {
+          console.warn("Skipping malformed metadata comment (missing essential fields):", mc);
+          continue;
+        }
+        
+        let contentToStore = mc.raw_content;
+        if (contentToStore == null) { // Checks for null or undefined
+          if (mc.content) {
+            contentToStore = getTextFromDocumentNode(mc.content) || "[Content not parsable]";
+          } else {
+            contentToStore = "[No content]";
+          }
+        }
+
+        const commentData = {
+          id: mc.id.toString(), // Ensure ID is a string
+          raw_content: contentToStore,
+          author_id: mc.author.id.toString(),
+          author_username: mc.author.username.toString(),
+          metadata_created_at: mc.created_at,
+        };
+        await room.collection(COLLECTION_NAME).upsert(commentData);
+      }
+      console.log("Finished syncing metadata comments.");
+    } catch (error) {
+      console.error("Error syncing metadata comments:", error);
+      setSyncError(`Failed to sync comments: ${error.message}`);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  useEffect(() => {
+    const performSyncOperation = async () => {
+      setSyncError(null); // Clear previous sync error
+      setIsSyncing(true); // Indicate that a sync operation is starting
+      await syncMetadataComments(); 
     };
 
-    // Delay slightly to ensure window.websim.metadata.comments is populated
-    // This is a practical consideration if metadata might load asynchronously
-    // with the main script. If it's guaranteed to be there, timeout is not strictly needed.
-    const timeoutId = setTimeout(syncMetadataComments, 100);
+    performSyncOperation(); // Perform initial sync
+
+    const intervalId = setInterval(performSyncOperation, 7000); // Sync every 7 seconds
     
-    return () => clearTimeout(timeoutId); // Cleanup timeout if component unmounts
-  }, []);
+    return () => {
+      clearInterval(intervalId); // Cleanup interval on component unmount
+    };
+  }, []); // Empty dependency array: runs once on mount, cleans up on unmount.
 
   const { data: syncedComments, loading: loadingDbComments, error: queryError } = useQuery(
     room.query(
@@ -221,4 +226,3 @@ function CommentItem({ comment }) {
 
 const root = createRoot(document.getElementById('root'));
 root.render(<App />);
-
